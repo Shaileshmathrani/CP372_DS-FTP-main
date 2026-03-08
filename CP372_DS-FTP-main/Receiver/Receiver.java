@@ -3,38 +3,446 @@ import java.io.*;
 import java.util.*;
 
 /**
- * DS-FTP Sender Implementation
+ * DS-FTP Receiver Implementation
  * 
  * Implements both Stop-and-Wait and Go-Back-N protocol variants
- * Handles packet permutation via ChaosEngine for GBN mode
+ * Handles ACK dropping based on Reliability Number (RN) via ChaosEngine
  * 
- * Command line: 
- *   Stop-and-Wait: java Sender <rcv_ip> <rcv_data_port> <sender_ack_port> <input_file> <timeout_ms>
- *   Go-Back-N:    java Sender <rcv_ip> <rcv_data_port> <sender_ack_port> <input_file> <timeout_ms> <window_size>
+ * Command line: java Receiver <sender_ip> <sender_ack_port> <rcv_data_port> <output_file> <RN>
  */
-public class Sender {
+public class Receiver {
     
-    // Socket for receiving ACKs
-    private DatagramSocket ackSocket;
+    // Socket for receiving data packets
+    private DatagramSocket dataSocket;
     
-    // Receiver's address and port for data packets
-    private InetAddress receiverAddress;
-    private int receiverDataPort;
+    // Receiver's listening port - used when creating the socket
+    private int rcvDataPort;
     
-    // Sender's ACK listening port
+    // Sender's address and port for ACKs
+    private InetAddress senderAddress;
     private int senderAckPort;
     
-    // Input file
-    private String inputFileName;
-    private FileInputStream fileInputStream;
+    // Output file
+    private String outputFileName;
+    private FileOutputStream fileOutputStream;
     
-    // Protocol parameters
-    private int timeoutMs;
-    private Integer windowSize; // null for Stop-and-Wait, non-null for GBN
+    // Reliability Number for ACK dropping
+    private int rn;
     
     // Protocol state
-    private int base = 0;           // Oldest unacknowledged packet
-    private int nextSeqNum = 0;      // Next sequence number to send
+    private int expectedSeqNum = 0;      // Next expected sequence number
+    private int lastAckSent = -1;        // Last ACK sent (cumulative for GBN)
+    private int ackCount = 0;             // Counter for ChaosEngine ACK dropping (1-indexed)
+    
+    // GBN specific: Buffer for out-of-order packets
+    private Map<Integer, DSPacket> packetBuffer;
+    private boolean isGBN = false;        // Will be detected from packet flow
+    private int lastSeqNum = -1;           // Last received sequence number
+    private int outOfOrderCount = 0;       // Count of out-of-order packets to detect GBN
+    
+    // Window size for GBN receiver (estimated)
+    private static final int RECEIVER_WINDOW_SIZE = 32; // Conservative estimate
+    
+    // Logging
+    private PrintWriter logger;
+    
+    public Receiver(String senderIp, int senderAckPort, int rcvDataPort, 
+                    String outputFile, int rn) throws Exception {
+        
+        this.senderAddress = InetAddress.getByName(senderIp);
+        this.senderAckPort = senderAckPort;
+        this.rcvDataPort = rcvDataPort;
+        this.outputFileName = outputFile;
+        this.rn = rn;
+        
+        // Initialize buffer for GBN
+        this.packetBuffer = new HashMap<>();
+        
+        // Create socket for receiving data - with address reuse
+        dataSocket = new DatagramSocket(rcvDataPort);
+        dataSocket.setReuseAddress(true); // Allow reuse of address
+        
+        // Setup output file
+        fileOutputStream = new FileOutputStream(outputFileName);
+        
+        // Setup logging
+        logger = new PrintWriter(new FileWriter("receiver_log.txt"), true);
+        log("Receiver started on port " + rcvDataPort);
+        log("Sending ACKs to " + senderIp + ":" + senderAckPort);
+        log("RN = " + rn);
+    }
+    
+    /**
+     * Main receiver loop
+     */
+    public void run() throws Exception {
+        boolean transferComplete = false;
+        
+        log("Waiting for SOT packet...");
+        
+        while (!transferComplete) {
+            try {
+                // Receive packet
+                byte[] receiveBuffer = new byte[DSPacket.MAX_PACKET_SIZE];
+                DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
+                dataSocket.receive(receivePacket);
+                
+                // Parse packet
+                DSPacket packet = new DSPacket(receivePacket.getData());
+                
+                log("Received: Type=" + packet.getType() + 
+                    ", Seq=" + packet.getSeqNum() + 
+                    ", Length=" + packet.getLength());
+                
+                // Process based on packet type
+                switch (packet.getType()) {
+                    case DSPacket.TYPE_SOT:
+                        handleSOT(packet);
+                        break;
+                        
+                    case DSPacket.TYPE_DATA:
+                        handleData(packet);
+                        break;
+                        
+                    case DSPacket.TYPE_EOT:
+                        handleEOT(packet);
+                        transferComplete = true;
+                        break;
+                        
+                    default:
+                        log("WARNING: Unknown packet type " + packet.getType());
+                }
+                
+            } catch (SocketTimeoutException e) {
+                log("Timeout waiting for packet - ignoring");
+            } catch (Exception e) {
+                log("Error processing packet: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+        
+        cleanup();
+    }
+    
+    /**
+     * Handle SOT (Start of Transmission) packet
+     */
+    private void handleSOT(DSPacket packet) throws Exception {
+        // Verify SOT has seq=0
+        if (packet.getSeqNum() != 0) {
+            log("ERROR: SOT packet has wrong sequence number: " + packet.getSeqNum());
+            return;
+        }
+        
+        log("Received SOT, sending ACK");
+        
+        // Send ACK for SOT
+        sendACK(0);
+        
+        // Reset protocol state
+        expectedSeqNum = 1;  // First DATA packet should have seq=1
+        lastAckSent = 0;
+        packetBuffer.clear();
+        isGBN = false;
+        lastSeqNum = -1;
+        outOfOrderCount = 0;
+    }
+    
+    /**
+     * Handle DATA packet - with protocol detection
+     */
+    private void handleData(DSPacket packet) throws Exception {
+        int seqNum = packet.getSeqNum();
+        
+        // Detect GBN mode if we see out-of-order packets
+        if (!isGBN && lastSeqNum != -1) {
+            int expectedNext = (lastSeqNum + 1) % 128;
+            if (seqNum != expectedNext) {
+                outOfOrderCount++;
+                log("Out-of-order detected: got " + seqNum + ", expected " + expectedNext + 
+                    " (count: " + outOfOrderCount + ")");
+                
+                if (outOfOrderCount >= 3) {
+                    isGBN = true;
+                    log("Switching to GBN mode due to out-of-order packets");
+                    packetBuffer.clear();
+                }
+            } else {
+                // Reset counter if we get in-order packets
+                outOfOrderCount = Math.max(0, outOfOrderCount - 1);
+            }
+        }
+        
+        lastSeqNum = seqNum;
+        
+        // Handle based on detected mode
+        if (isGBN) {
+            handleDataGBN(packet);
+        } else {
+            handleDataStopAndWait(packet);
+        }
+    }
+    
+    /**
+     * Handle DATA packet for Stop-and-Wait mode
+     */
+    private void handleDataStopAndWait(DSPacket packet) throws Exception {
+        int seqNum = packet.getSeqNum();
+        
+        if (seqNum == expectedSeqNum) {
+            // Expected packet - write and ACK
+            log("Stop-and-Wait: Received expected packet " + seqNum);
+            
+            // Write payload to file
+            if (packet.getLength() > 0) {
+                fileOutputStream.write(packet.getPayload());
+                fileOutputStream.flush();
+            }
+            
+            // Send ACK
+            sendACK(seqNum);
+            
+            // Update expected sequence
+            expectedSeqNum = (expectedSeqNum + 1) % 128;
+            lastAckSent = seqNum;
+            
+        } else {
+            // Duplicate or out-of-order - resend last ACK
+            log("Stop-and-Wait: Received unexpected packet " + seqNum + 
+                ", expected " + expectedSeqNum + " - resending ACK " + lastAckSent);
+            
+            if (lastAckSent >= 0) {
+                sendACK(lastAckSent);
+            }
+        }
+    }
+    
+    /**
+     * Handle DATA packet for Go-Back-N mode with buffering
+     */
+    private void handleDataGBN(DSPacket packet) throws Exception {
+        int seqNum = packet.getSeqNum();
+        
+        log("GBN: Received packet " + seqNum + ", expectedSeq=" + expectedSeqNum);
+        
+        // Check if packet is within receive window
+        if (isWithinWindow(seqNum, expectedSeqNum, RECEIVER_WINDOW_SIZE)) {
+            // Packet is within window - buffer it if not already received
+            if (!packetBuffer.containsKey(seqNum)) {
+                packetBuffer.put(seqNum, packet);
+                log("GBN: Buffered packet " + seqNum);
+            } else {
+                log("GBN: Duplicate packet " + seqNum + " ignored");
+            }
+            
+            // Deliver contiguous packets in order
+            deliverBufferedPackets();
+            
+        } else {
+            // Packet outside window - discard and resend cumulative ACK
+            log("GBN: Packet " + seqNum + " outside window - discarding, resending ACK " + lastAckSent);
+            if (lastAckSent >= 0) {
+                sendACK(lastAckSent);
+            }
+        }
+    }
+    
+    /**
+     * Check if a sequence number is within the receive window
+     */
+    private boolean isWithinWindow(int seqNum, int expected, int windowSize) {
+        // Handle modulo 128 arithmetic
+        if (expected <= (expected + windowSize) % 128) {
+            // No wrap-around
+            return seqNum >= expected && seqNum <= expected + windowSize;
+        } else {
+            // Wrap-around
+            return seqNum >= expected || seqNum <= (expected + windowSize) % 128;
+        }
+    }
+    
+    /**
+     * Deliver any buffered packets that are now in order
+     */
+    private void deliverBufferedPackets() throws Exception {
+        boolean delivered;
+        
+        do {
+            delivered = false;
+            
+            // Check if expected packet is in buffer
+            if (packetBuffer.containsKey(expectedSeqNum)) {
+                DSPacket packet = packetBuffer.remove(expectedSeqNum);
+                
+                // Write payload
+                if (packet.getLength() > 0) {
+                    fileOutputStream.write(packet.getPayload());
+                    fileOutputStream.flush();
+                }
+                
+                log("GBN: Delivered packet " + expectedSeqNum);
+                
+                // Update expected sequence
+                expectedSeqNum = (expectedSeqNum + 1) % 128;
+                delivered = true;
+            }
+            
+        } while (delivered);
+        
+        // Send cumulative ACK for last contiguous packet
+        int cumulativeAck = (expectedSeqNum - 1 + 128) % 128; // Last delivered sequence
+        if (cumulativeAck != lastAckSent) {
+            sendACK(cumulativeAck);
+            lastAckSent = cumulativeAck;
+            log("GBN: Sent cumulative ACK " + cumulativeAck);
+        }
+    }
+    
+    /**
+     * Handle EOT (End of Transmission) packet
+     */
+    private void handleEOT(DSPacket packet) throws Exception {
+        log("Received EOT with seq=" + packet.getSeqNum());
+        
+        // Verify EOT sequence number
+        int expectedEotSeq = (expectedSeqNum) % 128;
+        if (packet.getSeqNum() != expectedEotSeq) {
+            log("WARNING: EOT sequence mismatch. Got " + packet.getSeqNum() + 
+                ", expected " + expectedEotSeq);
+        }
+        
+        // Send ACK for EOT
+        sendACK(packet.getSeqNum());
+        
+        log("Transfer complete");
+    }
+    
+    /**
+     * Send ACK packet (with possible dropping via ChaosEngine)
+     */
+    private void sendACK(int ackSeqNum) throws Exception {
+        // Increment ACK counter (1-indexed as required by ChaosEngine)
+        ackCount++;
+        
+        // Check if this ACK should be dropped
+        if (ChaosEngine.shouldDrop(ackCount, rn)) {
+            log("ChaosEngine: DROPPING ACK " + ackCount + " for seq " + ackSeqNum);
+            return; // Simulate loss by not sending
+        }
+        
+        log("Sending ACK for seq " + ackSeqNum + " (ACK #" + ackCount + ")");
+        
+        // Create ACK packet
+        DSPacket ackPacket = new DSPacket(DSPacket.TYPE_ACK, ackSeqNum, null);
+        
+        // Convert to bytes
+        byte[] sendData = ackPacket.toBytes();
+        
+        // Send to sender's ACK port
+        DatagramPacket sendPacket = new DatagramPacket(
+            sendData, sendData.length, senderAddress, senderAckPort
+        );
+        
+        dataSocket.send(sendPacket);
+    }
+    
+    /**
+     * Verify the received file
+     */
+    private void verifyReceivedFile() {
+        File received = new File(outputFileName);
+        
+        log("\n=== File Transfer Verification ===");
+        log("Received file: " + outputFileName);
+        log("Received file size: " + received.length() + " bytes");
+        log("=================================\n");
+    }
+    
+    /**
+     * Clean up resources
+     */
+    private void cleanup() throws Exception {
+        if (fileOutputStream != null) {
+            fileOutputStream.close();
+        }
+        
+        if (dataSocket != null && !dataSocket.isClosed()) {
+            dataSocket.close();
+        }
+        
+        if (logger != null) {
+            logger.close();
+        }
+        
+        // Verify the received file
+        verifyReceivedFile();
+        
+        log("Receiver finished. Output file: " + outputFileName);
+    }
+    
+    /**
+     * Logging utility
+     */
+    private void log(String message) {
+        String timestamp = new java.text.SimpleDateFormat("HH:mm:ss.SSS").format(new Date());
+        String logMessage = "[" + timestamp + "] " + message;
+        System.out.println(logMessage);
+        if (logger != null) {
+            logger.println(logMessage);
+        }
+    }
+    
+    public static void main(String[] args) {
+        // Validate command line arguments
+        if (args.length != 5) {
+            System.err.println("Usage: java Receiver <sender_ip> <sender_ack_port> " +
+                             "<rcv_data_port> <output_file> <RN>");
+            System.err.println("Example: java Receiver 127.0.0.1 3000 4000 received_file.txt 0");
+            System.exit(1);
+        }
+        
+        try {
+            // Parse arguments
+            String senderIp = args[0];
+            int senderAckPort = Integer.parseInt(args[1]);
+            int rcvDataPort = Integer.parseInt(args[2]);
+            String outputFile = args[3];
+            int rn = Integer.parseInt(args[4]);
+            
+            // Validate RN
+            if (rn < 0) {
+                System.err.println("RN must be >= 0");
+                System.exit(1);
+            }
+            
+            // Validate ports
+            if (senderAckPort < 1024 || senderAckPort > 65535 || 
+                rcvDataPort < 1024 || rcvDataPort > 65535) {
+                System.err.println("Ports must be between 1024 and 65535");
+                System.exit(1);
+            }
+            
+            // Create and run receiver
+            Receiver receiver = new Receiver(senderIp, senderAckPort, rcvDataPort, outputFile, rn);
+            receiver.run();
+            
+        } catch (NumberFormatException e) {
+            System.err.println("Invalid port or RN number: " + e.getMessage());
+            System.exit(1);
+        } catch (SocketException e) {
+            System.err.println("Socket error: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        } catch (FileNotFoundException e) {
+            System.err.println("Output file error: " + e.getMessage());
+            System.exit(1);
+        } catch (Exception e) {
+            System.err.println("Unexpected error: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+}    private int nextSeqNum = 0;      // Next sequence number to send
     private int expectedAck = 0;      // Expected ACK for Stop-and-Wait
     
     // Timeout management
